@@ -207,6 +207,7 @@ class DeepseekV41Indexer(nn.Module):
         indices_output=None,
         quantized_query=None,
         query_scale=None,
+        candidate_reuse=None,
     ):
         """Run QLI V2 on paged INT8 K; candidates are block IDs, not positions.
 
@@ -265,6 +266,16 @@ class DeepseekV41Indexer(nn.Module):
         if quantized_query is None:
             quantized_query, query_scale = self.quantize_query(query)
         weights = weights.to(torch.float16)
+        if uses_candidate_filter and candidate_reuse is not None:
+            selected = candidate_reuse.select(quantized_query, weights, query_scale)
+            selected = prepare_indexer_indices(
+                selected,
+                positions,
+                self.compress_ratio,
+                indices_output=indices_output,
+                lengths_output=topk_lengths,
+            )
+            return selected, candidates
         key, key_scale = source_cache
         key_scale = key_scale.squeeze(-1)  # Preserve the Hybrid cache page stride.
         cu_seqlens_q = source_metadata.query_start_loc
@@ -283,7 +294,7 @@ class DeepseekV41Indexer(nn.Module):
         op_metadata = source_metadata.qli_metadata
         wait_for_device_metadata(DeviceMetadataStage.INDEXER, id(op_metadata))
         mode = 1 if is_candidate_source else 2 if uses_candidate_filter else 3
-        if mode == 2 and envs.VLLM_ASCEND_QLI_CANDIDATE_SKIP:
+        if mode == 2 and (envs.VLLM_ASCEND_QLI_CANDIDATE_SKIP or envs.VLLM_ASCEND_QLI_CANDIDATE_REUSE):
             mode = 4
         selected, _, candidate_out = torch.ops._C_ascend.npu_quant_lightning_indexer_v3(
             quantized_query,

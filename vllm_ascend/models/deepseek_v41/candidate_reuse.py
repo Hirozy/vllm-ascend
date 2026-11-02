@@ -14,6 +14,41 @@ INVALID_CANDIDATE = (1 << 24) - 1
 CANDIDATE_BUFFER_BUDGET = 512 * 1024 * 1024
 
 
+def candidate_reuse_layers(topology, local_layers):
+    """Find a local candidate source and consumers sharing uncompressed K.
+
+    Non-index-source layers already reuse TopK and need no packed K. A group
+    must include its candidate source and KV owner on this pipeline stage;
+    require at least two consumers to amortize preparing the shared buffer.
+    """
+    local_layers = frozenset(local_layers)
+    source = topology.layer(topology.candidate_source_layer_id)
+    count = topology.candidate_topk_blocks
+    if (
+        source.layer_idx not in local_layers
+        or source.kv_source_layer not in local_layers
+        or not source.is_index_source
+        or not source.is_candidate_source
+        or source.compress_ratio != 1
+        or topology.candidate_block_size != CANDIDATE_BLOCK_SIZE
+        or not 0 < count <= MAX_CANDIDATES
+        or count % 64
+        or (count - 1) * CANDIDATE_BLOCK_SIZE + 1 < topology.index_topk
+    ):
+        return ()
+    consumers = tuple(
+        role.layer_idx
+        for role in topology.layers
+        if role.layer_idx in local_layers
+        and role.layer_idx > source.layer_idx
+        and role.is_index_source
+        and role.uses_candidate_filter
+        and role.kv_source_layer == source.kv_source_layer
+        and role.compress_ratio == source.compress_ratio
+    )
+    return (source.layer_idx, *consumers) if len(consumers) >= 2 else ()
+
+
 class CandidateKBuffer:
     """The candidate source overwrites active rows on every forward/replay.
 
@@ -85,6 +120,7 @@ class CandidateKBuffer:
             or key.shape[1] <= 0
             or key.shape[2:] != (1, INDEX_WIDTH)
             or key.dtype != torch.int8
+            or key.device != self.key.device
             or key.stride()[1:] != (INDEX_WIDTH, INDEX_WIDTH, 1)
             or key.stride(0) % INDEX_WIDTH
             or key.stride(0) < key.shape[1] * INDEX_WIDTH
@@ -95,7 +131,6 @@ class CandidateKBuffer:
             or scale.stride(0) < scale.shape[1]
             or scale.device != key.device
             or key.shape[1] % CANDIDATE_BLOCK_SIZE
-            or source_metadata.max_cache_seq_len >= INVALID_CANDIDATE * CANDIDATE_BLOCK_SIZE
         ):
             return False
         table = source_metadata.block_table

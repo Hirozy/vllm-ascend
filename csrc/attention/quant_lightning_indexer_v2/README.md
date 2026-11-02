@@ -34,7 +34,34 @@ AIC 核数时，mode=4 在内核中沿 K 维分配任务，再归并各分片的
 
 DeepSeek-V4.1 可通过 `VLLM_ASCEND_QLI_CANDIDATE_SKIP=1` 将候选消费者切换到
 mode=4；默认值为 `0`，保持 mode=2。该开关复用已有候选层配置，不改变候选数或块大小。
-此路径仍计算所有可见 K，尚未实现仅加载候选 K 的 gather 计算。
+mode=4 本身仍计算所有可见 K。下面的复用路径通过提前物化候选 K 减少消费者的计算量。
+
+## A3 跨层候选 K 复用
+
+DeepSeek-V4.1 可通过 `VLLM_ASCEND_QLI_CANDIDATE_REUSE=1` 启用候选 K/scale
+复用，默认值为 `0`。该开关同时启用 mode=4 回退，无需另设 `VLLM_ASCEND_QLI_CANDIDATE_SKIP`。
+当前模型接入仅在 A3 启用；A2 未验证，A5 继续使用其 packed-cache 后端。
+
+候选源在每次 forward 中调用 [QliCandidateGather](../qli_candidate_gather/README.md)，
+按原块号升序打包各 query 可见的候选 K/scale、原始位置和有效长度。后续消费者分别使用自己的
+Q 和 weights，调用 `candidate_mode=5`，再将 packed 索引恢复成原始位置，并执行原有索引整理。
+mode=5 要求 `TND/PA_BBND`、`mask_mode=0`、`cmp_ratio=1`、每个 packed batch 一个 query，
+块大小为 8。它保留 mode=4 的块降序、块内升序同分优先级，不需要传入候选块列表。
+
+模型仅为同一 PP 阶段内、相同 KV owner、压缩比为 1 的候选源及至少两个 index-source
+消费者分配共享缓冲。只复用 TopK 的普通层不参与。候选必须来自原生候选源、互不重复；
+容量必须保证尾块只有一个可见 token 时仍足够选 TopK，短 K 则由候选源覆盖全部位置。
+不满足拓扑、布局或行容量约束时，消费者使用 mode=4。
+
+四个持久 payload 缓冲合计最多 512 MiB；候选数 2048 时最多容纳 244 行，超过时回退。
+静态 packed metadata 在初始化时生成，另有少量 metadata、页表和临时排序空间。
+source 每次执行都覆盖当前行，包括 graph replay；没有 Python ready 标记。
+query 的 TND 前缀和必须覆盖输入行，padding 请求使用零 K 长度。
+
+此开关面向长上下文。短上下文中打包成本可能超过减少计算的收益，因此默认关闭。
+不能用 Python 当前 K 长度在 capture 时选择路径：replay 会改变设备长度而不会重跑此判断。
+模型最大长度同时受 FP32 块号排序的精确表示范围约束，必须小于 `(2^24-1)*8`。
+性能应比较完整的“一次准备 + 多消费者 + 索引恢复”，不得只计 packed QLI。
 
 ## 参数说明
 

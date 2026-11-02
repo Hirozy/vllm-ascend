@@ -54,6 +54,7 @@ from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.utils.torch_utils import kv_cache_dtype_str_to_dtype
 
+from vllm_ascend import envs as ascend_envs
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.attention.dsa_v1 import AscendDSAImpl, OProjBufferPool
 from vllm_ascend.attention.dsa_v41 import (
@@ -79,6 +80,13 @@ from vllm_ascend.utils import (
 from .cache_config import (
     make_mla_cache_spec,
     make_swa_cache_spec,
+)
+from .candidate_reuse import (
+    CANDIDATE_BLOCK_SIZE,
+    INDEX_WIDTH,
+    INVALID_CANDIDATE,
+    CandidateKBuffer,
+    candidate_reuse_layers,
 )
 from .compressor import DeepseekV41Compressor
 from .decoder_replay_layers import make_decoder_replay
@@ -709,6 +717,7 @@ class DeepseekV41Attention(DeepseekV41SWAAttention):
         self.role = role
         self.topology = topology
         self.shared_state = None
+        self.candidate_k_buffer = None
         self.prefix = prefix
         self.packed_cache_ops = DeviceOperator.get_dsv41_packed_cache_ops()
         width = config.head_dim
@@ -1023,6 +1032,7 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
         for layer in self.layers:
             if isinstance(layer, DeepseekV41DecoderLayer):
                 layer.self_attn.shared_state = self.shared_attention_state
+        self._initialize_candidate_reuse(vllm_config, topology)
         self.engram_root = vllm_config.model_config.model
         config = self.config
         self.engram_weight_root = self.engram_root
@@ -1095,6 +1105,32 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
 
         self.decoder_replay_start = self.end_layer
         self.decoder_replay_layers = make_decoder_replay(self, vllm_config)
+
+    def _initialize_candidate_reuse(self, vllm_config, topology):
+        if (
+            not ascend_envs.VLLM_ASCEND_QLI_CANDIDATE_REUSE
+            or not get_current_hardware_profile().supports(HardwareCapability.QLI_CANDIDATE_K_REUSE)
+            or int(self.config.index_head_dim) != INDEX_WIDTH
+            or vllm_config.model_config.max_model_len >= INVALID_CANDIDATE * CANDIDATE_BLOCK_SIZE
+        ):
+            return
+        local_attention = {
+            layer.self_attn.role.layer_idx: layer.self_attn
+            for layer in self.layers
+            if isinstance(layer, DeepseekV41DecoderLayer)
+        }
+        reuse_layers = candidate_reuse_layers(topology, local_attention)
+        if not reuse_layers:
+            return
+        buffer = CandidateKBuffer(
+            vllm_config.scheduler_config.max_num_batched_tokens,
+            int(self.config.index_n_heads),
+            topology.index_topk,
+            topology.candidate_topk_blocks,
+            self.topk_indices_buffer.device,
+        )
+        for layer_id in reuse_layers:
+            local_attention[layer_id].candidate_k_buffer = buffer
 
     def _make_empty_intermediate_tensors(self, batch_size, dtype, device):
         return IntermediateTensors(

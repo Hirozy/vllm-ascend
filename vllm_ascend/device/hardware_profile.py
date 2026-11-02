@@ -149,6 +149,9 @@ class HardwareCapability(Enum):
     RC_DEVICE_DISCOVERY = auto()
     # Fused RMSNorm+cast is available for the A2/A3 (CANN 9.1) path.
     RMS_NORM_CAST = auto()
+    # Pack paged INT8 index K/FP16 scales and consume it with QLI mode 5.
+    # Initially enabled on the A3 stack validated for candidate reuse.
+    QLI_CANDIDATE_K_REUSE = auto()
     # Import and register the compiled vLLM-Ascend custom-op library at runtime.
     # This is independent of whether custom ops are enabled by default.
     RUNTIME_CUSTOM_OPS = auto()
@@ -282,6 +285,7 @@ _STANDARD_CAPABILITIES = frozenset(
 _A3_CAPABILITIES = _STANDARD_CAPABILITIES | {
     HardwareCapability.MC2_FULLMESH_V2_COMM,
     HardwareCapability.RMS_NORM_CAST,
+    HardwareCapability.QLI_CANDIDATE_K_REUSE,
 }
 _DEFAULT_WORKER_CLS = "vllm_ascend.worker.worker.NPUWorker"
 _HARDWARE_PROFILES: Mapping[AscendDeviceType, HardwareProfile] = MappingProxyType(

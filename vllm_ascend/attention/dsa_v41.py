@@ -633,6 +633,14 @@ class AscendDSAV41Impl:
         assert prepared_indexer is not None
         if prepared_indexer.quantize_done is not None:
             torch.npu.current_stream().wait_event(prepared_indexer.quantize_done)
+        # The source and eligible consumers resolve the same cache prefix and
+        # request metadata. Eligibility depends on shapes/layouts, not lengths
+        # whose values can change without re-entering Python during replay.
+        candidate_reuse = getattr(attn, "candidate_k_buffer", None)
+        if candidate_reuse is not None and not candidate_reuse.supports(
+            hidden_states.shape[0], source_cache, metadata.indexer.cache, self.role.compress_ratio
+        ):
+            candidate_reuse = None
         selected, candidates = attn.indexer.select_projected(
             prepared_indexer.query,
             prepared_indexer.weights,
@@ -641,6 +649,7 @@ class AscendDSAV41Impl:
             metadata.indexer.cache,
             quantized_query=prepared_indexer.quantized_query,
             query_scale=prepared_indexer.query_scale,
+            candidate_reuse=candidate_reuse if self.role.uses_candidate_filter else None,
             is_candidate_source=self.role.is_candidate_source,
             uses_candidate_filter=self.role.uses_candidate_filter,
             candidate_topk_blocks=self.topology.candidate_topk_blocks,
@@ -659,6 +668,8 @@ class AscendDSAV41Impl:
             shared.topk_indices[: selected.shape[0]].copy_(selected)
         if self.role.is_candidate_source:
             shared.candidates[: candidates.shape[0]].copy_(candidates)
+            if candidate_reuse is not None:
+                candidate_reuse.prepare(shared.candidates[: candidates.shape[0]], source_cache, metadata.indexer.cache)
         return shared.topk_indices[: hidden_states.shape[0]]
 
     def _forward_attention(self, attn, q, metadata, compressed_indices, *, source_cache=None):

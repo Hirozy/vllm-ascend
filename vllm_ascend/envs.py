@@ -76,6 +76,12 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Valid values: "0" keeps candidate_mode=2; "1" selects mode=4 with compact
     # sorting and eligible small-query split-K scheduling. Not sensitive.
     "VLLM_ASCEND_QLI_CANDIDATE_SKIP": lambda: os.getenv("VLLM_ASCEND_QLI_CANDIDATE_SKIP", "0") == "1",
+    # Reuse packed candidate K/scale across eligible DeepSeek-V4.1 indexer
+    # consumers on A3. Default: "0" (disabled); valid values: "0", "1".
+    # "1" also enables mode-4 fallback when packing is ineligible. Reserves
+    # up to 512 MiB of payload per model; intended for long contexts, since
+    # preparation can regress short-context latency. Not sensitive.
+    "VLLM_ASCEND_QLI_CANDIDATE_REUSE": lambda: os.getenv("VLLM_ASCEND_QLI_CANDIDATE_REUSE", "0") == "1",
 }
 
 # end-env-vars-definition
