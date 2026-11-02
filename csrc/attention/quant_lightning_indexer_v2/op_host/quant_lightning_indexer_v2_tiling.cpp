@@ -428,11 +428,17 @@ ge::graphStatus QLIV2InfoParser::CheckAttrParaInfo()
     uint32_t candidateMode = (opParamInfo_.candidateMode != nullptr) ?
                                  static_cast<uint32_t>(*opParamInfo_.candidateMode) : CANDIDATE_MODE_OFF;
     OP_CHECK_IF((candidateMode != CANDIDATE_MODE_SOURCE) && (candidateMode != CANDIDATE_MODE_CONSUMER) &&
-                    (candidateMode != CANDIDATE_MODE_OFF) && (candidateMode != CANDIDATE_MODE_CONSUMER_SKIP),
+                    (candidateMode != CANDIDATE_MODE_OFF) && (candidateMode != CANDIDATE_MODE_CONSUMER_SKIP) &&
+                    (candidateMode != CANDIDATE_MODE_PACKED),
                 OP_LOGE_FOR_INVALID_VALUE_WITH_REASON(opName_, "candidate_mode",
                                                       std::to_string(candidateMode),
                                                       "Candidate_mode only supports 1(source), 2(consumer), "
-                                                      "3(off) or 4(consumer_skip)"),
+                                                      "3(off), 4(consumer_skip) or 5(packed)"),
+                return ge::GRAPH_FAILED);
+    OP_CHECK_IF(candidateMode == CANDIDATE_MODE_PACKED &&
+                    (*opParamInfo_.sparseMode != 0 || *opParamInfo_.cmpRatio != 1 || layout_query != "TND" ||
+                     layout_key != "PA_BBND"),
+                OP_LOGE(opName_, "Packed candidate mode requires TND/PA_BBND, mask_mode=0 and cmp_ratio=1."),
                 return ge::GRAPH_FAILED);
     if (candidateMode != CANDIDATE_MODE_OFF) {
         // candidate 功能当前仅在 arch22 (910b/910_93) 实现

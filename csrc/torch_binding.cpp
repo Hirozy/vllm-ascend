@@ -45,6 +45,7 @@
 #include "attention/sparse_flash_mla/sparse_flash_mla_torch_adpt.h"
 #include "attention/kv_compress_epilog_v2/kv_compress_epilog_v2_torch_adpt.h"
 #include "attention/quant_lightning_indexer_v2/quant_lightning_indexer_v2_torch_adpt.h"
+#include "attention/qli_candidate_gather/qli_candidate_gather_torch_adpt.h"
 #include "attention/kv_quant_sparse_flash_attention_vllm/kv_quant_sparse_flash_attention_vllm_torch_adpt.h"
 #include "attention/fused_sparse_attention_overlap/fused_sparse_attention_overlap_torch_adpt.h"
 #include "attention/fused_lightning_indexer_manage/fused_lightning_indexer_manage_torch_adpt.h"
@@ -3117,6 +3118,14 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
              &vllm_ascend::qli_v2::QuantLightningIndexerCandidate);
     ops.impl("npu_quant_lightning_indexer_v3", torch::kMeta,
              &vllm_ascend::qli_v2::QuantLightningIndexerCandidate);
+
+    ops.def(
+        "qli_candidate_gather(Tensor key, Tensor scale, Tensor sorted_candidates, Tensor block_table, "
+        "Tensor cu_seqlens_q, Tensor seq_lens_k, int key_page_stride, int scale_page_stride, int page_size, "
+        "Tensor(a!) packed_key, Tensor(b!) packed_scale, Tensor(c!) positions, Tensor(d!) lengths) -> ()"
+    );
+    ops.impl("qli_candidate_gather", torch::kPrivateUse1, &vllm_ascend::qli_candidate_gather);
+    ops.impl("qli_candidate_gather", torch::kMeta, &vllm_ascend::qli_candidate_gather);
 
     ops.def(
         "npu_sparse_flash_mla_metadata(int num_heads_q, int num_heads_kv, int head_dim, *, "

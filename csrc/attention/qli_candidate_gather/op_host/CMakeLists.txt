@@ -1,0 +1,6 @@
+add_op_to_compiled_list()
+if (BUILD_OPEN_PROJECT)
+    target_sources(op_host_aclnn PRIVATE qli_candidate_gather_def.cpp)
+endif()
+add_modules_sources(OPTYPE qli_candidate_gather ACLNNTYPE aclnn)
+add_ops_compile_options(OP_NAME QliCandidateGather OPTIONS --cce-auto-sync=off)

@@ -138,7 +138,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> QuantLightningIndexerCandidate(
     char *keyLayoutPtr = const_cast<char *>(keyLayoutStr.c_str());
     int64_t returnValue = 0;
 
-    TORCH_CHECK(candidateMode >= 1 && candidateMode <= 4, "Invalid candidate_mode");
+    TORCH_CHECK(candidateMode >= 1 && candidateMode <= 5, "Invalid candidate_mode");
     TORCH_CHECK((candidateMode != 2 && candidateMode != 4) || candidateTopkIndexIn.has_value(),
                 "Consumer requires candidate blocks");
     if (query.device().is_meta()) return {sparseIndicesOut, sparseValuesOut, candidateTopkIndexOut};

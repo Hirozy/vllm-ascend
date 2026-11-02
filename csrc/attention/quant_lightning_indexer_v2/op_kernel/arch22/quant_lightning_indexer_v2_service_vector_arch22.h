@@ -94,6 +94,8 @@ private:
     __aicore__ inline int32_t BuildCandidateCompact(const QLIV2Common::RunInfo &info, int32_t cuS1Idx,
                                                     int32_t cuBaseS2Idx, int32_t innerS1Idx,
                                                     const LocalTensor<float> &mmInUb, int32_t cuS2Len);
+    __aicore__ inline int32_t BuildPackedSort(int32_t cuBaseS2Idx, const LocalTensor<float> &scores,
+                                             int32_t visible);
     __aicore__ inline void ProcessCandBlockTopk(const QLIV2Common::RunInfo &info, int32_t cuS1Idx, int32_t cuS2Len,
                                                 int32_t cuS2LenVecAlign, int32_t cuRealAcSeq, int32_t innerS1Idx);
     __aicore__ inline void CopyOutCandTopkIndex(const QLIV2Common::RunInfo &info, int32_t cuS1Idx, int32_t innerS1Idx);
@@ -661,6 +663,54 @@ __aicore__ inline int32_t QLIV2Vector<QLIV2T>::BuildCandidateCompact(const QLIV2
     return s;
 }
 
+// Dense packed candidates need the same descending-block/ascending-token
+// tie priority as mode 4. Build that order directly instead of reloading and
+// sorting a constant list of all packed block IDs on every consumer layer.
+template <typename QLIV2T>
+__aicore__ inline int32_t QLIV2Vector<QLIV2T>::BuildPackedSort(
+    int32_t cuBaseS2Idx, const LocalTensor<float> &scores, int32_t visible)
+{
+    constexpr uint32_t BLOCK_SHIFT = 3;
+    constexpr uint32_t SCORE_BYTE_SHIFT = 2;
+    constexpr int32_t BLOCK_SIZE = 1 << BLOCK_SHIFT;
+    const int32_t aligned = AlignS2(visible);
+    const int32_t blocks = CeilDiv(visible, BLOCK_SIZE);
+    const int32_t slots = blocks * BLOCK_SIZE;
+    const int32_t lastStart = (blocks - 1) * BLOCK_SIZE;
+    const int32_t lastCount = visible - lastStart;
+    auto tmp = tmpBuf_.Get<float>();
+    auto scoreOut = tmp;
+    auto indexOut = tmp[aligned].template ReinterpretCast<int32_t>();
+    auto offsets = tmp[4096].template ReinterpretCast<uint32_t>();
+    Duplicate(scoreOut.template ReinterpretCast<int32_t>(), QLIV2ServiceVec::NEG_INF, aligned);
+    Duplicate(indexOut, QLIV2ServiceVec::INVALID_INDEX, aligned);
+    PipeBarrier<PIPE_V>();
+    ShiftRight(offsets, globalTopkIndice_.template ReinterpretCast<uint32_t>(), BLOCK_SHIFT, slots);
+    PipeBarrier<PIPE_V>();
+    ShiftLeft(offsets, offsets, BLOCK_SHIFT + 1, slots);
+    PipeBarrier<PIPE_V>();
+    Sub(offsets.template ReinterpretCast<int32_t>(), globalTopkIndice_,
+        offsets.template ReinterpretCast<int32_t>(), slots);
+    PipeBarrier<PIPE_V>();
+    Adds(offsets.template ReinterpretCast<int32_t>(), offsets.template ReinterpretCast<int32_t>(), lastStart, slots);
+    PipeBarrier<PIPE_V>();
+    // The first reversed block may be partial. Copy only its visible values;
+    // padding must retain (-inf, -1), never an uninitialized DMA tail.
+    Adds(scoreOut.template ReinterpretCast<int32_t>(), scores[lastStart].template ReinterpretCast<int32_t>(),
+         0, lastCount);
+    Adds(indexOut, globalTopkIndice_, cuBaseS2Idx + lastStart, lastCount);
+    if (slots > BLOCK_SIZE) {
+        Adds(indexOut[BLOCK_SIZE], offsets[BLOCK_SIZE].template ReinterpretCast<int32_t>(),
+             cuBaseS2Idx, slots - BLOCK_SIZE);
+        PipeBarrier<PIPE_V>();
+        ShiftLeft(offsets[BLOCK_SIZE], offsets[BLOCK_SIZE], SCORE_BYTE_SHIFT, slots - BLOCK_SIZE);
+        PipeBarrier<PIPE_V>();
+        Gather(scoreOut[BLOCK_SIZE], scores, offsets[BLOCK_SIZE], 0, slots - BLOCK_SIZE);
+    }
+    PipeBarrier<PIPE_V>();
+    return aligned;
+}
+
 // mode=1 (is_candidate_source): 块内 amax (log2(blockSize) 轮 Max 树) + pin 尾块 + 块级排序/归并
 template <typename QLIV2T>
 __aicore__ inline void QLIV2Vector<QLIV2T>::ProcessCandBlockTopk(const QLIV2Common::RunInfo &info, int32_t cuS1Idx,
@@ -989,6 +1039,7 @@ __aicore__ inline void QLIV2Vector<QLIV2T>::ProcessVec1(const QLIV2Common::RunIn
             // mode=2 等价, 见 BuildCandidateCompact 头注释); 0 = 本 tile 无候选块, 跳过排序与归并
             int32_t compactSortLen = 0;
             const bool compactMode = constInfo_.candidateMode == CANDIDATE_MODE_CONSUMER_SKIP;
+            const bool packedMode = constInfo_.candidateMode == CANDIDATE_MODE_PACKED;
             if (compactMode && info.isFirstS2InnerLoop) {
                 LoadCandidateRow(info, cuS1Idx, innerS1Idx);
                 const uint64_t rowBit = uint64_t{1} << innerS1Idx;
@@ -997,7 +1048,7 @@ __aicore__ inline void QLIV2Vector<QLIV2T>::ProcessVec1(const QLIV2Common::RunIn
                     compactAllowedRows_ |= rowBit;
                 }
             }
-            bool candSkip = compactMode && ((compactAllowedRows_ >> innerS1Idx) & 1U);
+            bool candSkip = packedMode || (compactMode && ((compactAllowedRows_ >> innerS1Idx) & 1U));
             if (constInfo_.candidateMode == CANDIDATE_MODE_CONSUMER || (compactMode && !candSkip)) {
                 BuildCandidateMask(info, cuS1Idx, cuBaseS2Idx, innerS1Idx);
                 PipeBarrier<PIPE_V>();
@@ -1009,7 +1060,8 @@ __aicore__ inline void QLIV2Vector<QLIV2T>::ProcessVec1(const QLIV2Common::RunIn
                 Add(mmInUb, mmInUb, pen, cuS2Len);
                 PipeBarrier<PIPE_V>();
             } else if (candSkip) {
-                compactSortLen = BuildCandidateCompact(info, cuS1Idx, cuBaseS2Idx, innerS1Idx, mmInUb, cuS2Len);
+                compactSortLen = packedMode ? BuildPackedSort(cuBaseS2Idx, mmInUb, cuS2Len) :
+                    BuildCandidateCompact(info, cuS1Idx, cuBaseS2Idx, innerS1Idx, mmInUb, cuS2Len);
                 inQueue_.FreeTensor(mmInUb);
             }
             if (!candSkip) {
@@ -1169,7 +1221,8 @@ template <typename QLIV2T>
 __aicore__ inline void QLIV2Vector<QLIV2T>::ProcessLD()
 {
     constexpr uint32_t SORT_GROUP_SIZE = 32;
-    const uint32_t mergeCount = constInfo_.candidateMode == CANDIDATE_MODE_CONSUMER_SKIP ?
+    const uint32_t mergeCount = (constInfo_.candidateMode == CANDIDATE_MODE_CONSUMER_SKIP ||
+                                constInfo_.candidateMode == CANDIDATE_MODE_PACKED) ?
         CeilDiv(constInfo_.sparseCount, SORT_GROUP_SIZE) * SORT_GROUP_SIZE : BASE_TOPK;
     const uint32_t mergePairElements = mergeCount * 2;
     LocalTensor<float> curValueIdxUb = ldToBeMrgBuf_.Get<float>();
@@ -1233,7 +1286,8 @@ __aicore__ inline void QLIV2Vector<QLIV2T>::ProcessLD()
             srcList.src2 = curValueIdxUb[BASE_TOPK_VALUE_IDX_SIZE];
             srcList.src3 = curValueIdxUb[2 * BASE_TOPK_VALUE_IDX_SIZE];
             srcList.src4 = curValueIdxUb[3 * BASE_TOPK_VALUE_IDX_SIZE];
-            if (constInfo_.candidateMode == CANDIDATE_MODE_CONSUMER_SKIP) {
+            if (constInfo_.candidateMode == CANDIDATE_MODE_CONSUMER_SKIP ||
+                constInfo_.candidateMode == CANDIDATE_MODE_PACKED) {
                 // Local merging prioritizes newer K tiles on equal scores.
                 // Preserve that order across shards, including NEG_HUGE fills.
                 srcList.src1 = curValueIdxUb[3 * BASE_TOPK_VALUE_IDX_SIZE];
@@ -1277,7 +1331,8 @@ __aicore__ inline void QLIV2Vector<QLIV2T>::ProcessLD()
             srcList.src2 = curValueIdxUb[BASE_TOPK_VALUE_IDX_SIZE];
             srcList.src3 = curValueIdxUb[2 * BASE_TOPK_VALUE_IDX_SIZE];
             srcList.src4 = curValueIdxUb[3 * BASE_TOPK_VALUE_IDX_SIZE];
-            if (constInfo_.candidateMode == CANDIDATE_MODE_CONSUMER_SKIP) {
+            if (constInfo_.candidateMode == CANDIDATE_MODE_CONSUMER_SKIP ||
+                constInfo_.candidateMode == CANDIDATE_MODE_PACKED) {
                 srcList.src1 = curValueIdxUb[ldTailLen * BASE_TOPK_VALUE_IDX_SIZE];
                 srcList.src2 = ldTailLen == 1 ? curValueIdxUb[0] : curValueIdxUb[BASE_TOPK_VALUE_IDX_SIZE];
                 srcList.src3 = curValueIdxUb[0];
