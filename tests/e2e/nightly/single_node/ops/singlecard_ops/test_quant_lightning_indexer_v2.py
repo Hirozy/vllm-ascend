@@ -266,15 +266,18 @@ def test_quant_lightning_indexer_v2_high_physical_page_scale_offset():
 
 @pytest.mark.parametrize("ratio", [1, 2])
 @pytest.mark.parametrize("query_count", [1, 2, 5])
+@pytest.mark.parametrize("candidate_mode", [2, 4])
+@pytest.mark.parametrize("candidate_pattern", ["alternating", "clustered", "duplicate", "empty"])
+@pytest.mark.parametrize("topk", [512, 1024])
 @pytest.mark.skipif(
     get_ascend_device_type() not in (AscendDeviceType.A2, AscendDeviceType.A3),
     reason="QuantLightningIndexer candidate mode is supported only on Ascend A2/A3",
 )
-def test_candidate_consumer_preserves_each_query_mask(ratio, query_count):
+def test_candidate_consumer_preserves_each_query_mask(ratio, query_count, candidate_pattern, topk, candidate_mode):
     """A multi-query tile must reload each row's candidates across KV tiles."""
     torch.manual_seed(71)
     device = "npu"
-    heads, width, topk, block_size, kv_len = 64, 128, 1024, 128, 6144
+    heads, width, block_size, kv_len = 64, 128, 128, 6144
     query = torch.randint(-90, 90, (query_count, heads, width), dtype=torch.int8, device=device)
     key = torch.randint(-90, 90, (kv_len // block_size, block_size, 1, width), dtype=torch.int8, device=device)
     weights = torch.rand(query_count, heads, dtype=torch.float16, device=device)
@@ -288,6 +291,14 @@ def test_candidate_consumer_preserves_each_query_mask(ratio, query_count):
     # first. A stale mask remains plausible but selects forbidden positions.
     masks = [torch.cat((torch.arange(256), torch.arange(512, 768))), torch.arange(256, 768)]
     candidates_cpu = torch.stack([masks[row % 2] for row in range(query_count)]).int()
+    if candidate_pattern == "clustered":
+        candidates_cpu[:] = masks[0]
+    elif candidate_pattern == "duplicate":
+        # Only eight distinct eligible positions; duplicate block IDs must not
+        # make the fast path believe that TopK valid candidates exist.
+        candidates_cpu.zero_()
+    elif candidate_pattern == "empty":
+        candidates_cpu.fill_(-1)
     candidates = candidates_cpu.unsqueeze(1).to(device)
     common = dict(
         cu_seqlens_q=qsl,
@@ -321,7 +332,7 @@ def test_candidate_consumer_preserves_each_query_mask(ratio, query_count):
         block_table=table,
         metadata=metadata,
         candidate_topk_index=candidates,
-        candidate_mode=2,
+        candidate_mode=candidate_mode,
         candidate_topk_blocks=512,
         candidate_block_size=8,
         **common,
@@ -330,4 +341,83 @@ def test_candidate_consumer_preserves_each_query_mask(ratio, query_count):
         assert indices.unique().numel() == topk
         visible = (kv_len * ratio - query_count + row + 1) // ratio
         assert ((indices >= 0) & (indices < visible)).all()
-        assert torch.isin(indices // 8, candidates_cpu[row]).all(), f"wrong candidate row at query {row}"
+        if candidate_pattern in ("alternating", "clustered"):
+            assert torch.isin(indices // 8, candidates_cpu[row]).all(), f"wrong candidate row at query {row}"
+        elif candidate_pattern == "duplicate":
+            assert torch.isin(torch.arange(8), indices).all()
+
+
+@pytest.mark.parametrize(
+    "query_count,kv_len,topk,candidate_count",
+    [
+        (1, 1025, 512, 64),
+        (6, 1025, 512, 64),
+        (6, 4097, 512, 2048),
+        (5, 16385, 1024, 2048),
+        (17, 16385, 513, 2048),
+        (91, 4097, 17, 2048),
+        (158, 4097, 512, 2048),
+    ],
+)
+@pytest.mark.parametrize("pattern", ["source", "duplicate", "empty", "future", "clustered"])
+@pytest.mark.skipif(
+    get_ascend_device_type() not in (AscendDeviceType.A2, AscendDeviceType.A3),
+    reason="QuantLightningIndexer candidate mode is supported only on Ascend A2/A3",
+)
+def test_candidate_compact_matches_mask_at_causal_boundary(query_count, kv_len, topk, candidate_count, pattern):
+    """Compact mode must preserve mask semantics, including insufficient candidates."""
+    torch.manual_seed(71)
+    device = "npu"
+    heads, width, page_size, candidate_block_size = 32, 128, 128, 8
+    pages = (kv_len + page_size - 1) // page_size
+    query = torch.randint(-90, 90, (query_count, heads, width), dtype=torch.int8, device=device)
+    key = torch.randint(-90, 90, (pages, page_size, 1, width), dtype=torch.int8, device=device)
+    weights = torch.rand(query_count, heads, dtype=torch.float16, device=device)
+    query_scale = torch.full((query_count, heads), 0.01, dtype=torch.float16, device=device)
+    key_scale = torch.full(key.shape[:-1], 0.01, dtype=torch.float16, device=device)
+    common = dict(
+        cu_seqlens_q=torch.tensor([0, query_count], dtype=torch.int32, device=device),
+        seqused_k=torch.tensor([kv_len], dtype=torch.int32, device=device),
+        max_seqlen_q=query_count,
+        layout_q="TND",
+        layout_k="PA_BBND",
+        mask_mode=3,
+        cmp_ratio=1,
+    )
+    metadata = torch.ops._C_ascend.npu_quant_lightning_indexer_v2_metadata(
+        heads, 1, width, topk, 2, batch_size=1, max_seqlen_k=kv_len, device=device, **common
+    )
+    table = torch.arange(pages, dtype=torch.int32, device=device).unsqueeze(0)
+
+    def run(mode, candidates=None):
+        return torch.ops._C_ascend.npu_quant_lightning_indexer_v3(
+            query,
+            key,
+            weights,
+            query_scale,
+            key_scale,
+            topk,
+            2,
+            block_table=table,
+            metadata=metadata,
+            candidate_topk_index=candidates,
+            candidate_mode=mode,
+            candidate_topk_blocks=candidate_count,
+            candidate_block_size=candidate_block_size,
+            **common,
+        )
+
+    candidates = run(1)[2]
+    if pattern == "duplicate":
+        candidates[..., 1::2] = candidates[..., ::2]
+    elif pattern == "empty":
+        candidates.fill_(-1)
+    elif pattern == "future":
+        candidates[..., 0] = kv_len // candidate_block_size + 5
+    elif pattern == "clustered":
+        candidates = torch.arange(candidate_count, dtype=torch.int32, device=device)
+        candidates = candidates.repeat(query_count, 1).unsqueeze(1)
+    reference = run(2, candidates)[0].cpu().sort(dim=-1).values
+    for _ in range(3):
+        actual = run(4, candidates)[0].cpu().sort(dim=-1).values
+        torch.testing.assert_close(actual, reference, rtol=0, atol=0)

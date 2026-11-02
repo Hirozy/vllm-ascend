@@ -8,6 +8,7 @@ from torch import nn
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import ReplicatedLinear
 
+from vllm_ascend import envs
 from vllm_ascend.attention.dsa_v41 import (
     DeepseekV41CacheLayer,
     scatter_cache_sk,
@@ -282,6 +283,8 @@ class DeepseekV41Indexer(nn.Module):
         op_metadata = source_metadata.qli_metadata
         wait_for_device_metadata(DeviceMetadataStage.INDEXER, id(op_metadata))
         mode = 1 if is_candidate_source else 2 if uses_candidate_filter else 3
+        if mode == 2 and envs.VLLM_ASCEND_QLI_CANDIDATE_SKIP:
+            mode = 4
         selected, _, candidate_out = torch.ops._C_ascend.npu_quant_lightning_indexer_v3(
             quantized_query,
             key,

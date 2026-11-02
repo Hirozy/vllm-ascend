@@ -22,6 +22,20 @@
     2. 相关性结果与`query`和`key`对应的反量化系数`query_dequant_scale`（$Scale_Q$）和`key_dequant_scale`（$Scale_K^T$）相乘，通过激活函数$ReLU$过滤无效负相关信号后，得到当前Token与所有前序Token的相关性分数向量。
     3. 将其与权重系数`weights`（$W$）相乘后，沿g的方向，选取前$Top-k$个索引值得到输出$out$，作为Attention的输入。
 
+## A2/A3 候选消费者快速路径
+
+`candidate_mode=4` 接收与 mode=2 相同的候选块输入，紧凑收集候选分数后排序。
+候选重复或有效位置不足 TopK 时，逐行使用原有 mask 路径；因果尾块只拷贝可见位置。
+局部及最终归并按请求 TopK 的对齐长度处理，保留原 workspace 布局。
+
+单 batch、单 KV head、压缩后 K 长度至少 4096，且 query 按 4 行分组后少于
+AIC 核数时，mode=4 在内核中沿 K 维分配任务，再归并各分片的局部 TopK。
+其他规格使用原 metadata 调度。mode=1 的候选生成仍使用原路径。
+
+DeepSeek-V4.1 可通过 `VLLM_ASCEND_QLI_CANDIDATE_SKIP=1` 将候选消费者切换到
+mode=4；默认值为 `0`，保持 mode=2。该开关复用已有候选层配置，不改变候选数或块大小。
+此路径仍计算所有可见 K，尚未实现仅加载候选 K 的 gather 计算。
+
 ## 参数说明
 
 | 参数名                     | 输入/输出/属性 | 描述  | 数据类型       | 数据格式   |

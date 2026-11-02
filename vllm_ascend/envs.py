@@ -72,6 +72,10 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Control the aclrtMemcpyBatchAsync compile path for KV cache offloading.
     # "1": force enable, "0": force disable, None: auto-detect from CANN headers.
     "VLLM_ASCEND_ENABLE_BATCH_MEMCPY": lambda: os.getenv("VLLM_ASCEND_ENABLE_BATCH_MEMCPY", None),
+    # DeepSeek-V4.1 QLI consumer optimization on A2/A3. Default: "0" (disabled).
+    # Valid values: "0" keeps candidate_mode=2; "1" selects mode=4 with compact
+    # sorting and eligible small-query split-K scheduling. Not sensitive.
+    "VLLM_ASCEND_QLI_CANDIDATE_SKIP": lambda: os.getenv("VLLM_ASCEND_QLI_CANDIDATE_SKIP", "0") == "1",
 }
 
 # end-env-vars-definition

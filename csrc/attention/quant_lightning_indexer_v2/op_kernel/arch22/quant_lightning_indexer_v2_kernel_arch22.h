@@ -147,6 +147,7 @@ protected:
                                             __gm__ uint8_t *cmpResidualK);
     // ================================Split Core================================
     __aicore__ inline void SplitCore();
+    __aicore__ inline bool TrySplitCandidateCore();
     __aicore__ inline uint32_t GetS2BaseBlockNumOnMask(uint32_t s1gIdx, uint32_t actS1Size, uint32_t actS2SizeOrig,
                                                        uint32_t &validS2Len);
     __aicore__ inline uint32_t GetTotalBaseBlockNum();
@@ -355,11 +356,83 @@ __aicore__ inline uint32_t QLIV2Preload<QLIV2T>::GetTotalBaseBlockNum()
     return totalBlockNum;
 }
 
+// The A3 metadata path does not split K. Small query groups otherwise leave
+// most cores idle. Consumer-only splitting preserves the source candidate
+// accumulator contract and uses the existing local-topk/LD workspace protocol.
+template <typename QLIV2T>
+__aicore__ inline bool QLIV2Preload<QLIV2T>::TrySplitCandidateCore()
+{
+    if (constInfo.candidateMode != CANDIDATE_MODE_CONSUMER_SKIP ||
+        constInfo.batchSize != 1 || constInfo.kHeadNum != 1 ||
+        CeilDiv(constInfo.qSeqSize, constInfo.s1BaseSize) >= GetBlockNum()) {
+        return false;
+    }
+    uint32_t queryCount, keyCount, originalKeyCount;
+    GetS1S2ActualSeqLen(0, queryCount, keyCount, originalKeyCount);
+    const uint32_t groups = CeilDiv(queryCount, constInfo.s1BaseSize);
+    const uint32_t cores = GetBlockNum();
+    constexpr uint32_t MIN_SPLIT_TILES = 2;
+    if (groups == 0 || groups >= cores || keyCount < MIN_SPLIT_TILES * constInfo.s2BaseSize) {
+        return false;
+    }
+    const uint32_t coresPerGroup = cores / groups;
+    const uint32_t extraGroups = cores % groups;
+    const uint32_t largerGroupCores = (coresPerGroup + 1) * extraGroups;
+    const uint32_t group = aiCoreIdx < largerGroupCores ? aiCoreIdx / (coresPerGroup + 1) :
+        extraGroups + (aiCoreIdx - largerGroupCores) / coresPerGroup;
+    const uint32_t firstCore = group * coresPerGroup + Min(group, extraGroups);
+    const uint32_t shard = aiCoreIdx - firstCore;
+    uint32_t validLength = 0;
+    const uint32_t tiles = constInfo.attenMaskFlag ?
+        GetS2BaseBlockNumOnMask(group, queryCount, originalKeyCount, validLength) :
+        CeilDiv(keyCount, constInfo.s2BaseSize);
+    const uint32_t shards = Min(coresPerGroup + static_cast<uint32_t>(group < extraGroups), tiles);
+    coreZeroEnable = 1;
+    constInfo.coreEnable = shard < shards;
+    constInfo.bN2Start = 0;
+    constInfo.bN2End = 0;
+    constInfo.gS1Start = group;
+    constInfo.gS1End = group;
+    if (constInfo.coreEnable) {
+        constInfo.s2Start = shard * tiles / shards;
+        constInfo.s2End = (shard + 1) * tiles / shards;
+    }
+    ldInfo.saveWorkSpaceIdx = aiCoreIdx;
+    if ASCEND_IS_AIV {
+        // Two AIVs reduce each S1 group; each owns distinct output rows.
+        const uint32_t reduceGroup = tmpBlockIdx / 2;
+        ldInfo.isLdCoreEnable = reduceGroup < groups;
+        if (ldInfo.isLdCoreEnable) {
+            const uint32_t rows = Min(constInfo.s1BaseSize, queryCount - reduceGroup * constInfo.s1BaseSize);
+            const uint32_t firstRows = CeilDiv(rows, 2U);
+            ldInfo.mStart = (tmpBlockIdx % 2) * firstRows;
+            ldInfo.mNum = (tmpBlockIdx % 2) == 0 ? firstRows : rows / 2;
+            ldInfo.isLdCoreEnable = ldInfo.mNum != 0;
+            ldInfo.bn2Idx = 0;
+            ldInfo.bIdx = 0;
+            ldInfo.n2Idx = 0;
+            ldInfo.mIdx = reduceGroup;
+            ldInfo.workspaceIdx = reduceGroup * coresPerGroup + Min(reduceGroup, extraGroups);
+            const uint32_t reduceTiles = constInfo.attenMaskFlag ?
+                GetS2BaseBlockNumOnMask(reduceGroup, queryCount, originalKeyCount, validLength) :
+                CeilDiv(keyCount, constInfo.s2BaseSize);
+            ldInfo.workspaceNum = Min(coresPerGroup + static_cast<uint32_t>(reduceGroup < extraGroups), reduceTiles);
+            ldInfo.isLdCoreEnable = ldInfo.isLdCoreEnable && ldInfo.workspaceNum > 1;
+            ldInfo.indiceOutCoreOffset = static_cast<uint64_t>(reduceGroup) * constInfo.s1BaseSize *
+                constInfo.sparseCount;
+        }
+    }
+    return true;
+}
+
 // 多核版本，双闭区间。基本原则：计算每个核最少处理的块数,
 // 剩余的部分前面的核每个核多处理一块
 template <typename QLIV2T>
 __aicore__ void inline QLIV2Preload<QLIV2T>::SplitCore()
 {
+    if (TrySplitCandidateCore()) {
+        return;
+    }
     constInfo.coreEnable = metadataGm.GetValue(GetAttrAbsIndex(aiCoreIdx, QLI_V2_CORE_ENABLE_INDEX, false));
     if (aiCoreIdx != 0) {
         constInfo.bN2Start = metadataGm.GetValue(GetAttrAbsIndex(aiCoreIdx, QLI_V2_BN2_START_INDEX, false));
@@ -501,7 +574,9 @@ __aicore__ inline void QLIV2Preload<QLIV2T>::Init(
         qScaleGm.SetGlobalBuffer((__gm__ half *)queryScale);
         kScaleGm.SetGlobalBuffer((__gm__ half *)keyScale);
         blockTableGm.SetGlobalBuffer((__gm__ int32_t *)blockTable);
-        if (constInfo.candidateMode == CANDIDATE_MODE_CONSUMER && candidateTopkIndex != nullptr) {
+        if ((constInfo.candidateMode == CANDIDATE_MODE_CONSUMER ||
+             constInfo.candidateMode == CANDIDATE_MODE_CONSUMER_SKIP) &&
+            candidateTopkIndex != nullptr) {
             candidateTopkIndexInGm.SetGlobalBuffer((__gm__ int32_t *)candidateTopkIndex);
         }
         if (constInfo.candidateMode == CANDIDATE_MODE_SOURCE && candidateTopkIndexOut != nullptr) {

@@ -85,6 +85,15 @@ private:
     __aicore__ inline int32_t CountGE(const LocalTensor<float> &sortedDesc, int32_t n, float x);
     __aicore__ inline void BuildCandidateMask(const QLIV2Common::RunInfo &info, int32_t cuS1Idx,
                                               int32_t cuBaseS2Idx, int32_t innerS1Idx);
+    __aicore__ inline void LoadCandidateRow(const QLIV2Common::RunInfo &info, int32_t cuS1Idx,
+                                            int32_t innerS1Idx);
+    __aicore__ inline bool CanCompactCandidateRow(int32_t innerS1Idx, int32_t visibleTokens);
+    // A3 uses S1=4, hence at most two rows per AIV; bits reset on each first S2 tile.
+    uint64_t compactAllowedRows_ = 0;
+    // mode=4 (consumer skip): 候选块内紧凑收集, 返回紧凑排序长度 S (0=本 tile 无候选块)
+    __aicore__ inline int32_t BuildCandidateCompact(const QLIV2Common::RunInfo &info, int32_t cuS1Idx,
+                                                    int32_t cuBaseS2Idx, int32_t innerS1Idx,
+                                                    const LocalTensor<float> &mmInUb, int32_t cuS2Len);
     __aicore__ inline void ProcessCandBlockTopk(const QLIV2Common::RunInfo &info, int32_t cuS1Idx, int32_t cuS2Len,
                                                 int32_t cuS2LenVecAlign, int32_t cuRealAcSeq, int32_t innerS1Idx);
     __aicore__ inline void CopyOutCandTopkIndex(const QLIV2Common::RunInfo &info, int32_t cuS1Idx, int32_t innerS1Idx);
@@ -229,9 +238,11 @@ __aicore__ inline void QLIV2Vector<QLIV2T>::InitBuffers(TPipe *pipe)
         pipe->InitBuffer(blockSortOutBuf_, CeilDiv(s1BaseSize_, 2) * BASE_TOPK_VALUE_IDX_SIZE * sizeof(float)); // 32KB
         globalBlockTopkUb_ = blockSortOutBuf_.Get<float>();
         InitSortOutBuf(globalBlockTopkUb_, CeilDiv(s1BaseSize_, 2) * BASE_TOPK_VALUE_IDX_SIZE);
-    } else if (constInfo_.candidateMode == CANDIDATE_MODE_CONSUMER) {
+    } else if (constInfo_.candidateMode == CANDIDATE_MODE_CONSUMER ||
+               constInfo_.candidateMode == CANDIDATE_MODE_CONSUMER_SKIP) {
         // R6 修复: candBuf 按行分区 (每 AIV 处理 CeilDiv(s1BaseSize,2)=2 行, 行间 tile0 重排序
-        // 会互相覆盖) — 2 行 x 2048 对 x 8B = 32KB; mode=2 UB 预算 144+32+8=184KB <= 192KB
+        // 会互相覆盖) — 2 行 x 2048 对 x 8B = 32KB; mode=2/4 UB 预算 144+32+8=184KB <= 192KB
+        // mode=4 的候选不足或重复回退路径也使用 negHuge。
         pipe->InitBuffer(candBuf_, CeilDiv(s1BaseSize_, 2) * BASE_TOPK * 2 * sizeof(float));
         pipe->InitBuffer(candConstBuf_, BASE_TOPK * sizeof(float)); // 8KB: negHuge
         candNegHuge_ = candConstBuf_.Get<float>();
@@ -445,8 +456,80 @@ __aicore__ inline int32_t QLIV2Vector<QLIV2T>::CountGE(const LocalTensor<float> 
     return lo;
 }
 
-// mode=2 (use_candidate): 加载/排序候选行 (每行首个S2分片), 判定 tile 内块归属,
-// 产出 position 级 isOut (fp32 0/1, 1=候选外) 与其 int32 形式
+// Load and sort one candidate row on its first local S2 tile. The per-row
+// buffer is shared by mode 2 masking and mode 4 compact/fallback paths.
+template <typename QLIV2T>
+__aicore__ inline void QLIV2Vector<QLIV2T>::LoadCandidateRow(const QLIV2Common::RunInfo &info,
+                                                           int32_t cuS1Idx, int32_t innerS1Idx)
+{
+    int32_t candBlocks = static_cast<int32_t>(constInfo_.candidateTopkBlocks);
+    LocalTensor<float> tmp = tmpBuf_.Get<float>();
+    LocalTensor<float> candPairs = candBuf_.Get<float>()[innerS1Idx * candBlocks * 2];
+    // 加载候选行到 tmp 尾部, 转 fp32 后与有序索引组成 [values | idx] 对并降序排序
+    LocalTensor<int32_t> candInt = tmp[12288].template ReinterpretCast<int32_t>();
+    AscendC::DataCopyExtParams copyInParams;
+    copyInParams.blockCount = 1;
+    copyInParams.blockLen = candBlocks * sizeof(int32_t);
+    copyInParams.srcStride = 0;
+    copyInParams.dstStride = 0;
+    copyInParams.rsv = 0;
+    AscendC::DataCopyPadExtParams<int32_t> padParams{true, 0, 0, 0};
+    SetWaitFlag<HardEvent::V_MTE2>(HardEvent::V_MTE2);
+    AscendC::DataCopyPad(candInt,
+                         candidateTopkIndexInGm[info.candidateOutOffset +
+                                                cuS1Idx * constInfo_.candidateTopkBlocks],
+                         copyInParams, padParams);
+    SetWaitFlag<HardEvent::MTE2_V>(HardEvent::MTE2_V);
+    PipeBarrier<PIPE_V>();
+    Cast(candPairs, candInt, RoundMode::CAST_NONE, candBlocks);
+    PipeBarrier<PIPE_V>();
+    DataCopy(candPairs[candBlocks].template ReinterpretCast<int32_t>(), globalTopkIndice_, candBlocks);
+    PipeBarrier<PIPE_V>();
+    LocalTensor<float> candSortTmp = tmp[4096];
+    QLIV2ServiceVec::SortAll(candPairs, candSortTmp, candBlocks);
+    PipeBarrier<PIPE_V>();
+    // V->S 围栏: 排序结果对后续标量 GetValue (CountGE 二分) 可见
+    // (PipeBarrier<PIPE_V> 不足以保证标量读到 V 写数据; 参照 CANN topk_v200 的 SetFlag/WaitFlag<V_S> 模式)
+    SetWaitFlag<HardEvent::V_S>(HardEvent::V_S);
+}
+
+template <typename QLIV2T>
+__aicore__ inline bool QLIV2Vector<QLIV2T>::CanCompactCandidateRow(int32_t innerS1Idx, int32_t visibleTokens)
+{
+    const int32_t count = static_cast<int32_t>(constInfo_.candidateTopkBlocks);
+    const int32_t blockSize = static_cast<int32_t>(constInfo_.candidateBlockSize);
+    LocalTensor<float> pairs = candBuf_.Get<float>()[innerS1Idx * count * 2];
+    const int32_t nonnegative = CountGE(pairs, count, 0.0f);
+    const int32_t beyondEnd = CountGE(pairs, count, static_cast<float>(CeilDiv(visibleTokens, blockSize)));
+    int32_t validPositions = (nonnegative - beyondEnd) * blockSize;
+    if (visibleTokens % blockSize != 0 && beyondEnd < nonnegative &&
+        pairs.GetValue(2 * beyondEnd) == static_cast<float>(visibleTokens / blockSize)) {
+        validPositions -= blockSize - visibleTokens % blockSize;
+    }
+    if (validPositions < Min(static_cast<int32_t>(constInfo_.sparseCount), visibleTokens)) {
+        return false;
+    }
+    if (nonnegative < 2) {
+        return true;
+    }
+    // Reject duplicate nonnegative blocks: compacting duplicates changes top-K
+    // semantics and can overrun a tile-sized compact buffer. Ignore -1 padding.
+    LocalTensor<float> tmp = tmpBuf_.Get<float>();
+    LocalTensor<uint32_t> offsets = tmp[8192].template ReinterpretCast<uint32_t>();
+    constexpr uint32_t SORT_PAIR_BYTE_SHIFT = 3;
+    ShiftLeft(offsets, globalTopkIndice_.template ReinterpretCast<uint32_t>(),
+              SORT_PAIR_BYTE_SHIFT, nonnegative - 1);
+    PipeBarrier<PIPE_V>();
+    Gather(tmp[0], pairs, offsets, 0, nonnegative - 1);
+    Gather(tmp[2048], pairs, offsets, 2 * sizeof(float), nonnegative - 1);
+    PipeBarrier<PIPE_V>();
+    Sub(tmp[4096], tmp[0], tmp[2048], nonnegative - 1);
+    PipeBarrier<PIPE_V>();
+    ReduceMin(tmp[6144], tmp[4096], tmp[10240], nonnegative - 1, false);
+    SetWaitFlag<HardEvent::V_S>(HardEvent::V_S);
+    return tmp.GetValue(6144) > 0.0f;
+}
+
 template <typename QLIV2T>
 __aicore__ inline void QLIV2Vector<QLIV2T>::BuildCandidateMask(const QLIV2Common::RunInfo &info, int32_t cuS1Idx,
                                                                int32_t cuBaseS2Idx, int32_t innerS1Idx)
@@ -459,33 +542,8 @@ __aicore__ inline void QLIV2Vector<QLIV2T>::BuildCandidateMask(const QLIV2Common
     // 后一行的 tile0 重排序会覆盖前行候选 (s2 内层循环按 gS1 块整体推进) — candBuf 按行分区
     LocalTensor<float> tmp = tmpBuf_.Get<float>();
     LocalTensor<float> candPairs = candBuf_.Get<float>()[innerS1Idx * candBlocks * 2];
-    if (info.isFirstS2InnerLoop) {
-        // 加载候选行到 tmp 尾部, 转 fp32 后与有序索引组成 [values | idx] 对并降序排序
-        LocalTensor<int32_t> candInt = tmp[12288].template ReinterpretCast<int32_t>();
-        AscendC::DataCopyExtParams copyInParams;
-        copyInParams.blockCount = 1;
-        copyInParams.blockLen = candBlocks * sizeof(int32_t);
-        copyInParams.srcStride = 0;
-        copyInParams.dstStride = 0;
-        copyInParams.rsv = 0;
-        AscendC::DataCopyPadExtParams<int32_t> padParams{true, 0, 0, 0};
-        SetWaitFlag<HardEvent::V_MTE2>(HardEvent::V_MTE2);
-        AscendC::DataCopyPad(candInt,
-                             candidateTopkIndexInGm[info.candidateOutOffset +
-                                                    cuS1Idx * constInfo_.candidateTopkBlocks],
-                             copyInParams, padParams);
-        SetWaitFlag<HardEvent::MTE2_V>(HardEvent::MTE2_V);
-        PipeBarrier<PIPE_V>();
-        Cast(candPairs, candInt, RoundMode::CAST_NONE, candBlocks);
-        PipeBarrier<PIPE_V>();
-        DataCopy(candPairs[candBlocks].template ReinterpretCast<int32_t>(), globalTopkIndice_, candBlocks);
-        PipeBarrier<PIPE_V>();
-        LocalTensor<float> candSortTmp = tmp[4096];
-        QLIV2ServiceVec::SortAll(candPairs, candSortTmp, candBlocks);
-        PipeBarrier<PIPE_V>();
-        // V->S 围栏: 排序结果对后续标量 GetValue (CountGE 二分) 可见
-        // (PipeBarrier<PIPE_V> 不足以保证标量读到 V 写数据; 参照 CANN topk_v200 的 SetFlag/WaitFlag<V_S> 模式)
-        SetWaitFlag<HardEvent::V_S>(HardEvent::V_S);
+    if (info.isFirstS2InnerLoop && constInfo_.candidateMode != CANDIDATE_MODE_CONSUMER_SKIP) {
+        LoadCandidateRow(info, cuS1Idx, innerS1Idx);
     }
     // 候选与 tile 块号 [tileBlockBase, tileBlockBase+tileBlkNum) 的最小距离, 0 即命中
     // (candBuf 按行分区, R6: 同核行间覆盖已修复)
@@ -519,6 +577,88 @@ __aicore__ inline void QLIV2Vector<QLIV2T>::BuildCandidateMask(const QLIV2Common
     // R11 (leak 语义, §1.6): isOut 仅用于分数降级 (pen 链), 索引保留真实位置号 —
     // 候选外可达位置作为 topk 填充泄漏成有效索引 (对齐模型 where(idxs < compress_lens) 语义),
     // 不再把候选外索引改 -1 (原 isOutI32/CAST_RINT 链已删)。
+}
+
+// mode=4 (consumer skip): 候选块内紧凑收集 — 把 mode2 的 "全量计算 + 排序前 mask" 升级为
+// "skip 紧凑排序": 仅把本 tile 命中的候选块 (典型 ~16 块 = 128 位置) 的 score/位置搬入
+// 紧凑缓冲, SortAll 排序对象从 tile 全长 (2048) 降为 S (64 倍数的 AlignS2 形, ≤2048)。
+//
+// CanCompactCandidateRow checks that the row has unique candidate blocks and
+// enough visible positions for the requested TopK; otherwise the row uses the
+// original mask path, including its candidate-external fill semantics.
+//
+// tmpBuf_ layout (64KB, reused after loading candidates):
+//   [0, S) scores | [S, 2S) original indices
+//   [2S, 4S+4096) SortAll/MergeSort scratch (maximum end: 12288)
+//   [12288, 12288+s2BaseSize_) full-tile position vector
+// Copy score bit patterns with int32 Adds(+0) on PIPE_V. Only visible positions
+// are copied; the causal tail and aligned padding retain (-inf, -1).
+template <typename QLIV2T>
+__aicore__ inline int32_t QLIV2Vector<QLIV2T>::BuildCandidateCompact(const QLIV2Common::RunInfo &info,
+                                                                       int32_t cuS1Idx, int32_t cuBaseS2Idx,
+                                                                       int32_t innerS1Idx,
+                                                                       const LocalTensor<float> &mmInUb,
+                                                                       int32_t cuS2Len)
+{
+    int32_t candBlocks = static_cast<int32_t>(constInfo_.candidateTopkBlocks);
+    int32_t blockSize = static_cast<int32_t>(constInfo_.candidateBlockSize);
+    int32_t tileBlkNum = s2BaseSize_ / blockSize;
+    int32_t tileBlockBase = cuBaseS2Idx / blockSize;
+    LocalTensor<float> tmp = tmpBuf_.Get<float>();
+    LocalTensor<float> candPairs = candBuf_.Get<float>()[innerS1Idx * candBlocks * 2];
+    LocalTensor<float> candPairs2 = candBuf_.Get<float>()[innerS1Idx * candBlocks * 2];
+    int32_t lo = CountGE(candPairs2, candBlocks, static_cast<float>(tileBlockBase));
+    int32_t hi = CountGE(candPairs2, candBlocks, static_cast<float>(tileBlockBase + CeilDiv(cuS2Len, blockSize)));
+    int32_t candCnt = lo - hi;
+    if (candCnt <= 0) {
+        return 0; // 本 tile 无候选块: 调用方跳过排序与归并 (acc 保持前序 tile 状态)
+    }
+    int32_t nPairs = candCnt * blockSize;
+    // S: 紧凑排序长度 — 64 的倍数 (向量指令 count 对齐) 且为 AlignS2 形 (SortAll 支持)
+    int32_t s;
+    if (nPairs <= 64) {
+        s = 64;
+    } else if (nPairs <= 128) {
+        s = 128;
+    } else if (nPairs <= 256) {
+        s = 256;
+    } else if (nPairs <= 384) {
+        s = 384;
+    } else if (nPairs <= 512) {
+        s = 512;
+    } else if (nPairs <= 1024) {
+        s = 1024;
+    } else if (nPairs <= 1536) {
+        s = 1536;
+    } else {
+        s = 2048;
+    }
+    LocalTensor<int32_t> compactScoreI = tmp[0].template ReinterpretCast<int32_t>();
+    LocalTensor<int32_t> compactIdx = tmp[s].template ReinterpretCast<int32_t>();
+    LocalTensor<int32_t> mmInUbI = mmInUb.template ReinterpretCast<int32_t>();
+    LocalTensor<int32_t> fullPos = tmp[12288].template ReinterpretCast<int32_t>();
+    // pad 填充 (-inf/-1): S 为 64 倍数, 与 mode2 尾部填充语义一致 (不足 topk 时泄漏为 -1 槽)
+    Duplicate(compactScoreI, QLIV2ServiceVec::NEG_INF, s);
+    PipeBarrier<PIPE_V>();
+    Duplicate(compactIdx, QLIV2ServiceVec::INVALID_INDEX, s);
+    PipeBarrier<PIPE_V>();
+    // 整 tile 位置向量 [cuBaseS2Idx, cuBaseS2Idx+cuS2Len) (count 语义同主路径 Adds(sortIndice...))
+    Adds(fullPos, globalTopkIndice_, cuBaseS2Idx, cuS2Len);
+    PipeBarrier<PIPE_V>();
+    // 逐候选块搬运 score 与位置 (int32 Adds(+0), bit 精确); 标量 GetValue 读已排序候选
+    // (V_S fence 后稳定, 与 mask 路径 CountGE/GetValue 同款)
+    // Copy only visible positions. Padding remains (-inf, -1), including the
+    // incomplete causal block; no post-copy repair or uninitialized tail read.
+    for (int32_t j = hi; j < lo; j++) {
+        int32_t blkNum = static_cast<int32_t>(candPairs2.GetValue(2 * j));
+        int32_t bLocal = blkNum - tileBlockBase;
+        int32_t dst = (j - hi) * blockSize;
+        int32_t copyCount = Min(blockSize, cuS2Len - bLocal * blockSize);
+        AscendC::Adds(compactScoreI[dst], mmInUbI[bLocal * blockSize], 0, copyCount);
+        AscendC::Adds(compactIdx[dst], fullPos[bLocal * blockSize], 0, copyCount);
+    }
+    PipeBarrier<PIPE_V>();
+    return s;
 }
 
 // mode=1 (is_candidate_source): 块内 amax (log2(blockSize) 轮 Max 树) + pin 尾块 + 块级排序/归并
@@ -845,7 +985,20 @@ __aicore__ inline void QLIV2Vector<QLIV2T>::ProcessVec1(const QLIV2Common::RunIn
             PipeBarrier<PIPE_V>();
             // mode=2 (use_candidate, R11 leak): 候选块外 score 降级 NEG_HUGE (S4a, 纯算术无 NaN);
             // 仅降级排序资格、不取消入选资格 — 不足 topk 时候选外可达位置作为填充泄漏 (§1.6)
-            if (constInfo_.candidateMode == CANDIDATE_MODE_CONSUMER) {
+            // mode=4 (use_candidate + skip): 候选块内紧凑收集, 排序对象 2048 -> S (输出集合与
+            // mode=2 等价, 见 BuildCandidateCompact 头注释); 0 = 本 tile 无候选块, 跳过排序与归并
+            int32_t compactSortLen = 0;
+            const bool compactMode = constInfo_.candidateMode == CANDIDATE_MODE_CONSUMER_SKIP;
+            if (compactMode && info.isFirstS2InnerLoop) {
+                LoadCandidateRow(info, cuS1Idx, innerS1Idx);
+                const uint64_t rowBit = uint64_t{1} << innerS1Idx;
+                compactAllowedRows_ &= ~rowBit;
+                if (CanCompactCandidateRow(innerS1Idx, cuRealAcSeq)) {
+                    compactAllowedRows_ |= rowBit;
+                }
+            }
+            bool candSkip = compactMode && ((compactAllowedRows_ >> innerS1Idx) & 1U);
+            if (constInfo_.candidateMode == CANDIDATE_MODE_CONSUMER || (compactMode && !candSkip)) {
                 BuildCandidateMask(info, cuS1Idx, cuBaseS2Idx, innerS1Idx);
                 PipeBarrier<PIPE_V>();
                 LocalTensor<float> pen = tmpBuf_.Get<float>()[4096]; // blkIdxF/acc/d 已释放, 复用
@@ -855,7 +1008,11 @@ __aicore__ inline void QLIV2Vector<QLIV2T>::ProcessVec1(const QLIV2Common::RunIn
                 PipeBarrier<PIPE_V>();
                 Add(mmInUb, mmInUb, pen, cuS2Len);
                 PipeBarrier<PIPE_V>();
+            } else if (candSkip) {
+                compactSortLen = BuildCandidateCompact(info, cuS1Idx, cuBaseS2Idx, innerS1Idx, mmInUb, cuS2Len);
+                inQueue_.FreeTensor(mmInUb);
             }
+            if (!candSkip) {
             LocalTensor<float> sortBuff = tmpBuf_.Get<float>();
             LocalTensor<float> sortScoreUb = sortBuff;
             LocalTensor<float> sortIndiceUb = sortBuff[cuS2LenVecAlign];
@@ -887,6 +1044,23 @@ __aicore__ inline void QLIV2Vector<QLIV2T>::ProcessVec1(const QLIV2Common::RunIn
             QLIV2ServiceVec::MergeSort(globalTopkUb_[innerS1Idx * BASE_TOPK_VALUE_IDX_SIZE], BASE_TOPK, sortBuff,
                                        cuS2LenVecAlign, tmpSortBuf);
             PipeBarrier<PIPE_V>();
+            } else if (compactSortLen > 0) {
+                // mode=4: 紧凑缓冲已在 BuildCandidateCompact 构建于 tmp[0..2S) / idx tmp[S..2S);
+                // MergeSort 的 MrgSort tmp 需容纳 (S+2048)*2 对, 区域 [2S, 4S+4096) <= 12288
+                LocalTensor<float> sortBuff = tmpBuf_.Get<float>();
+                LocalTensor<float> tmpSortBuf = sortBuff[2 * compactSortLen];
+                QLIV2ServiceVec::SortAll(sortBuff, tmpSortBuf, compactSortLen);
+                PipeBarrier<PIPE_V>();
+                // Local top-K is sufficient for the final cross-core top-K.
+                // Keep the workspace layout; the unused suffix stays (-inf, -1).
+                constexpr uint32_t SORT_GROUP_SIZE = 32;
+                const uint32_t mergeCount = CeilDiv(constInfo_.sparseCount, SORT_GROUP_SIZE) * SORT_GROUP_SIZE;
+                QLIV2ServiceVec::MergeSort(globalTopkUb_[innerS1Idx * BASE_TOPK_VALUE_IDX_SIZE], mergeCount, sortBuff,
+                                           compactSortLen, tmpSortBuf);
+                PipeBarrier<PIPE_V>();
+            }
+            // compactSortLen == 0: 本 tile 无候选块, acc 保持前序 tile 状态 (行末 tile 必含
+            // pin 块, 单 tile 行不会出现 0 候选, needCopyOutGm 读 acc 恒有排序数据)
             bool isS2End = cuBaseS2Idx + s2BaseSize_ >= cuRealAcSeq;
             bool needCopyOutGm = blockS2StartIdx_ == 0 && isS2End;
             // 中间结果保存
@@ -994,6 +1168,10 @@ __aicore__ inline void QLIV2Vector<QLIV2T>::ProcessVec1(const QLIV2Common::RunIn
 template <typename QLIV2T>
 __aicore__ inline void QLIV2Vector<QLIV2T>::ProcessLD()
 {
+    constexpr uint32_t SORT_GROUP_SIZE = 32;
+    const uint32_t mergeCount = constInfo_.candidateMode == CANDIDATE_MODE_CONSUMER_SKIP ?
+        CeilDiv(constInfo_.sparseCount, SORT_GROUP_SIZE) * SORT_GROUP_SIZE : BASE_TOPK;
+    const uint32_t mergePairElements = mergeCount * 2;
     LocalTensor<float> curValueIdxUb = ldToBeMrgBuf_.Get<float>();
     LocalTensor<float> tmpUb = ldTmpBuf_.Get<float>();
 
@@ -1008,9 +1186,9 @@ __aicore__ inline void QLIV2Vector<QLIV2T>::ProcessLD()
 
     AscendC::DataCopyPadExtParams<float> indexValuePadParams{true, 0, 0, 0};
     AscendC::DataCopyExtParams indexValueParams;
-    indexValueParams.blockLen = BASE_TOPK_VALUE_IDX_SIZE * sizeof(int32_t); // bytes
-    indexValueParams.srcStride = 3 * BASE_TOPK_VALUE_IDX_SIZE * sizeof(int32_t);
-    indexValueParams.dstStride = 0;
+    indexValueParams.blockLen = mergePairElements * sizeof(int32_t); // bytes
+    indexValueParams.srcStride = (s1BaseSize_ * BASE_TOPK_VALUE_IDX_SIZE - mergePairElements) * sizeof(int32_t);
+    indexValueParams.dstStride = (BASE_TOPK_VALUE_IDX_SIZE - mergePairElements) * sizeof(int32_t) / 32;
 
     uint32_t ldProWorkspaceNum = ldInfo_.workspaceNum;
     uint32_t ldProcessLen = 4; // 4: 4块归约任务做一次Merge
@@ -1041,10 +1219,10 @@ __aicore__ inline void QLIV2Vector<QLIV2T>::ProcessLD()
                                  indexValuePadParams);
             // merge参数
             AscendC::MrgSort4Info params;
-            params.elementLengths[0] = BASE_TOPK;
-            params.elementLengths[1] = BASE_TOPK;
-            params.elementLengths[2] = BASE_TOPK;
-            params.elementLengths[3] = BASE_TOPK;
+            params.elementLengths[0] = mergeCount;
+            params.elementLengths[1] = mergeCount;
+            params.elementLengths[2] = mergeCount;
+            params.elementLengths[3] = mergeCount;
             params.ifExhaustedSuspension = true;
             params.validBit = 0b1111;
             params.repeatTimes = 1;
@@ -1055,9 +1233,17 @@ __aicore__ inline void QLIV2Vector<QLIV2T>::ProcessLD()
             srcList.src2 = curValueIdxUb[BASE_TOPK_VALUE_IDX_SIZE];
             srcList.src3 = curValueIdxUb[2 * BASE_TOPK_VALUE_IDX_SIZE];
             srcList.src4 = curValueIdxUb[3 * BASE_TOPK_VALUE_IDX_SIZE];
+            if (constInfo_.candidateMode == CANDIDATE_MODE_CONSUMER_SKIP) {
+                // Local merging prioritizes newer K tiles on equal scores.
+                // Preserve that order across shards, including NEG_HUGE fills.
+                srcList.src1 = curValueIdxUb[3 * BASE_TOPK_VALUE_IDX_SIZE];
+                srcList.src2 = curValueIdxUb[2 * BASE_TOPK_VALUE_IDX_SIZE];
+                srcList.src3 = curValueIdxUb[BASE_TOPK_VALUE_IDX_SIZE];
+                srcList.src4 = curValueIdxUb[0];
+            }
             MrgSort(tmpUb, srcList, params);
             PipeBarrier<PIPE_V>();
-            DataCopy(curValueIdxUb, tmpUb, BASE_TOPK_VALUE_IDX_SIZE);
+            DataCopy(curValueIdxUb, tmpUb, mergePairElements);
             PipeBarrier<PIPE_V>();
         }
 
@@ -1074,10 +1260,10 @@ __aicore__ inline void QLIV2Vector<QLIV2T>::ProcessLD()
                                  indexValuePadParams);
             SetWaitFlag<HardEvent::MTE2_V>(HardEvent::MTE2_V);
             AscendC::MrgSort4Info params;
-            params.elementLengths[0] = BASE_TOPK;
-            params.elementLengths[1] = BASE_TOPK;
-            params.elementLengths[2] = BASE_TOPK;
-            params.elementLengths[3] = BASE_TOPK;
+            params.elementLengths[0] = mergeCount;
+            params.elementLengths[1] = mergeCount;
+            params.elementLengths[2] = mergeCount;
+            params.elementLengths[3] = mergeCount;
             params.ifExhaustedSuspension = true;
             if (ldTailLen == 1) {
                 params.validBit = 0b0011;
@@ -1091,15 +1277,20 @@ __aicore__ inline void QLIV2Vector<QLIV2T>::ProcessLD()
             srcList.src2 = curValueIdxUb[BASE_TOPK_VALUE_IDX_SIZE];
             srcList.src3 = curValueIdxUb[2 * BASE_TOPK_VALUE_IDX_SIZE];
             srcList.src4 = curValueIdxUb[3 * BASE_TOPK_VALUE_IDX_SIZE];
+            if (constInfo_.candidateMode == CANDIDATE_MODE_CONSUMER_SKIP) {
+                srcList.src1 = curValueIdxUb[ldTailLen * BASE_TOPK_VALUE_IDX_SIZE];
+                srcList.src2 = ldTailLen == 1 ? curValueIdxUb[0] : curValueIdxUb[BASE_TOPK_VALUE_IDX_SIZE];
+                srcList.src3 = curValueIdxUb[0];
+            }
             PipeBarrier<PIPE_V>();
             MrgSort(tmpUb, srcList, params);
             PipeBarrier<PIPE_V>();
-            DataCopy(curValueIdxUb, tmpUb, BASE_TOPK_VALUE_IDX_SIZE);
+            DataCopy(curValueIdxUb, tmpUb, mergePairElements);
             PipeBarrier<PIPE_V>();
         }
 
         // 搬出
-        Extract(outValueUb, outIdxUb, curValueIdxUb, (BASE_TOPK / 32));
+        Extract(outValueUb, outIdxUb, curValueIdxUb, (mergeCount / 32));
         PipeBarrier<PIPE_V>();
         InitSortOutBuf(curValueIdxUb, BASE_TOPK_VALUE_IDX_SIZE);
         LocalTensor<int32_t> idxULocal1 = outIdxUb.template ReinterpretCast<int32_t>();
