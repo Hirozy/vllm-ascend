@@ -148,6 +148,8 @@ protected:
     // ================================Split Core================================
     __aicore__ inline void SplitCore();
     __aicore__ inline bool TrySplitCandidateCore();
+    __aicore__ inline void ResolveCandidateGroup(uint32_t group, uint32_t &batchIdx, uint32_t &localGroup,
+        uint32_t &queryCount, uint32_t &keyCount, uint32_t &originalKeyCount);
     __aicore__ inline uint32_t GetS2BaseBlockNumOnMask(uint32_t s1gIdx, uint32_t actS1Size, uint32_t actS2SizeOrig,
                                                        uint32_t &validS2Len);
     __aicore__ inline uint32_t GetTotalBaseBlockNum();
@@ -356,23 +358,54 @@ __aicore__ inline uint32_t QLIV2Preload<QLIV2T>::GetTotalBaseBlockNum()
     return totalBlockNum;
 }
 
+// Resolve a flattened query group without mixing requests' causal K ranges.
+template <typename QLIV2T>
+__aicore__ inline void QLIV2Preload<QLIV2T>::ResolveCandidateGroup(uint32_t group, uint32_t &batchIdx,
+    uint32_t &localGroup, uint32_t &queryCount, uint32_t &keyCount, uint32_t &originalKeyCount)
+{
+    localGroup = group;
+    for (batchIdx = 0; batchIdx < constInfo.batchSize; ++batchIdx) {
+        GetS1S2ActualSeqLen(batchIdx, queryCount, keyCount, originalKeyCount);
+        const uint32_t batchGroups = CeilDiv(queryCount, constInfo.s1BaseSize);
+        if (localGroup < batchGroups) {
+            return;
+        }
+        localGroup -= batchGroups;
+    }
+}
+
 // The A3 metadata path does not split K. Small query groups otherwise leave
 // most cores idle. Consumer-only splitting preserves the source candidate
 // accumulator contract and uses the existing local-topk/LD workspace protocol.
 template <typename QLIV2T>
 __aicore__ inline bool QLIV2Preload<QLIV2T>::TrySplitCandidateCore()
 {
+    const uint32_t cores = GetBlockNum();
+    // Bound scalar length-metadata reads. Large batches use the metadata schedule.
     if (constInfo.candidateMode != CANDIDATE_MODE_CONSUMER_SKIP ||
-        constInfo.batchSize != 1 || constInfo.kHeadNum != 1 ||
-        CeilDiv(constInfo.qSeqSize, constInfo.s1BaseSize) >= GetBlockNum()) {
+        constInfo.batchSize >= cores || constInfo.kHeadNum != 1) {
         return false;
     }
     uint32_t queryCount, keyCount, originalKeyCount;
-    GetS1S2ActualSeqLen(0, queryCount, keyCount, originalKeyCount);
-    const uint32_t groups = CeilDiv(queryCount, constInfo.s1BaseSize);
-    const uint32_t cores = GetBlockNum();
+    uint32_t groups = 0;
     constexpr uint32_t MIN_SPLIT_TILES = 2;
-    if (groups == 0 || groups >= cores || keyCount < MIN_SPLIT_TILES * constInfo.s2BaseSize) {
+    constexpr uint32_t MIN_CORES_PER_GROUP = 2;
+    for (uint32_t batchIdx = 0; batchIdx < constInfo.batchSize; ++batchIdx) {
+        GetS1S2ActualSeqLen(batchIdx, queryCount, keyCount, originalKeyCount);
+        if constexpr (Q_LAYOUT_T != LI_LAYOUT::TND) {
+            // Padded BSND rows need a single cleanup owner; retain its metadata schedule.
+            if (constInfo.batchSize > 1 && queryCount != constInfo.qSeqSize) {
+                return false;
+            }
+        }
+        groups += CeilDiv(queryCount, constInfo.s1BaseSize);
+        if (groups >= cores || (queryCount != 0 && keyCount < MIN_SPLIT_TILES * constInfo.s2BaseSize)) {
+            return false;
+        }
+    }
+    // With multiple requests, keep the metadata schedule unless every group
+    // can split K. A remaining one-core group otherwise limits batch latency.
+    if (groups == 0 || (constInfo.batchSize > 1 && groups > cores / MIN_CORES_PER_GROUP)) {
         return false;
     }
     const uint32_t coresPerGroup = cores / groups;
@@ -382,17 +415,22 @@ __aicore__ inline bool QLIV2Preload<QLIV2T>::TrySplitCandidateCore()
         extraGroups + (aiCoreIdx - largerGroupCores) / coresPerGroup;
     const uint32_t firstCore = group * coresPerGroup + Min(group, extraGroups);
     const uint32_t shard = aiCoreIdx - firstCore;
+    uint32_t batchIdx = 0;
+    uint32_t localGroup = group;
+    if (constInfo.batchSize > 1) {
+        ResolveCandidateGroup(group, batchIdx, localGroup, queryCount, keyCount, originalKeyCount);
+    }
     uint32_t validLength = 0;
     const uint32_t tiles = constInfo.attenMaskFlag ?
-        GetS2BaseBlockNumOnMask(group, queryCount, originalKeyCount, validLength) :
+        GetS2BaseBlockNumOnMask(localGroup, queryCount, originalKeyCount, validLength) :
         CeilDiv(keyCount, constInfo.s2BaseSize);
     const uint32_t shards = Min(coresPerGroup + static_cast<uint32_t>(group < extraGroups), tiles);
     coreZeroEnable = 1;
     constInfo.coreEnable = shard < shards;
-    constInfo.bN2Start = 0;
-    constInfo.bN2End = 0;
-    constInfo.gS1Start = group;
-    constInfo.gS1End = group;
+    constInfo.bN2Start = batchIdx;
+    constInfo.bN2End = batchIdx;
+    constInfo.gS1Start = localGroup;
+    constInfo.gS1End = localGroup;
     if (constInfo.coreEnable) {
         constInfo.s2Start = shard * tiles / shards;
         constInfo.s2End = (shard + 1) * tiles / shards;
@@ -403,23 +441,32 @@ __aicore__ inline bool QLIV2Preload<QLIV2T>::TrySplitCandidateCore()
         const uint32_t reduceGroup = tmpBlockIdx / 2;
         ldInfo.isLdCoreEnable = reduceGroup < groups;
         if (ldInfo.isLdCoreEnable) {
-            const uint32_t rows = Min(constInfo.s1BaseSize, queryCount - reduceGroup * constInfo.s1BaseSize);
+            localGroup = reduceGroup;
+            if (constInfo.batchSize > 1) {
+                ResolveCandidateGroup(reduceGroup, batchIdx, localGroup, queryCount, keyCount, originalKeyCount);
+            }
+            const uint32_t rows = Min(constInfo.s1BaseSize, queryCount - localGroup * constInfo.s1BaseSize);
             const uint32_t firstRows = CeilDiv(rows, 2U);
             ldInfo.mStart = (tmpBlockIdx % 2) * firstRows;
             ldInfo.mNum = (tmpBlockIdx % 2) == 0 ? firstRows : rows / 2;
             ldInfo.isLdCoreEnable = ldInfo.mNum != 0;
-            ldInfo.bn2Idx = 0;
-            ldInfo.bIdx = 0;
+            ldInfo.bn2Idx = batchIdx;
+            ldInfo.bIdx = batchIdx;
             ldInfo.n2Idx = 0;
-            ldInfo.mIdx = reduceGroup;
+            ldInfo.mIdx = localGroup;
             ldInfo.workspaceIdx = reduceGroup * coresPerGroup + Min(reduceGroup, extraGroups);
             const uint32_t reduceTiles = constInfo.attenMaskFlag ?
-                GetS2BaseBlockNumOnMask(reduceGroup, queryCount, originalKeyCount, validLength) :
+                GetS2BaseBlockNumOnMask(localGroup, queryCount, originalKeyCount, validLength) :
                 CeilDiv(keyCount, constInfo.s2BaseSize);
             ldInfo.workspaceNum = Min(coresPerGroup + static_cast<uint32_t>(reduceGroup < extraGroups), reduceTiles);
             ldInfo.isLdCoreEnable = ldInfo.isLdCoreEnable && ldInfo.workspaceNum > 1;
-            ldInfo.indiceOutCoreOffset = static_cast<uint64_t>(reduceGroup) * constInfo.s1BaseSize *
-                constInfo.sparseCount;
+            uint64_t queryPrefix;
+            if constexpr (Q_LAYOUT_T == LI_LAYOUT::TND) {
+                queryPrefix = batchIdx == 0 ? 0 : actualSeqLengthsGmQ.GetValue(batchIdx);
+            } else {
+                queryPrefix = static_cast<uint64_t>(batchIdx) * constInfo.qSeqSize;
+            }
+            ldInfo.indiceOutCoreOffset = (queryPrefix + localGroup * constInfo.s1BaseSize) * constInfo.sparseCount;
         }
     }
     return true;

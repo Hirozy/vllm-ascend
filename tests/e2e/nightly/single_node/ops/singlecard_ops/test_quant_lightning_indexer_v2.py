@@ -421,3 +421,109 @@ def test_candidate_compact_matches_mask_at_causal_boundary(query_count, kv_len, 
     for _ in range(3):
         actual = run(4, candidates)[0].cpu().sort(dim=-1).values
         torch.testing.assert_close(actual, reference, rtol=0, atol=0)
+
+
+def _make_multibatch_candidate_case(query_counts, key_lengths, layout, ratio, mask):
+    """Use disjoint shuffled pages and ragged lengths to expose cross-request offsets."""
+    torch.manual_seed(137)
+    device = "npu"
+    heads, width, page_size, topk, candidate_count = 32, 128, 128, 512, 2048
+    batch_size, max_query = len(query_counts), max(query_counts)
+    pages = (max(key_lengths) + page_size - 1) // page_size
+    query_shape = (sum(query_counts),) if layout == "TND" else (batch_size, max_query)
+    query = torch.randint(-90, 90, (*query_shape, heads, width), dtype=torch.int8, device=device)
+    key = torch.randint(-90, 90, (batch_size * pages, page_size, 1, width), dtype=torch.int8, device=device)
+    weights = torch.rand(*query_shape, heads, dtype=torch.float16, device=device)
+    query_scale = torch.full((*query_shape, heads), 0.01, dtype=torch.float16, device=device)
+    key_scale = torch.full(key.shape[:-1], 0.01, dtype=torch.float16, device=device)
+    table = torch.randperm(batch_size * pages, dtype=torch.int32, device=device).reshape(batch_size, pages)
+    common = dict(
+        seqused_k=torch.tensor(key_lengths, dtype=torch.int32, device=device),
+        max_seqlen_q=max_query,
+        layout_q=layout,
+        layout_k="PA_BBND",
+        mask_mode=mask,
+        cmp_ratio=ratio,
+    )
+    if layout == "TND":
+        prefix = [0]
+        for count in query_counts:
+            prefix.append(prefix[-1] + count)
+        common["cu_seqlens_q"] = torch.tensor(prefix, dtype=torch.int32, device=device)
+    else:
+        common["seqused_q"] = torch.tensor(query_counts, dtype=torch.int32, device=device)
+    if ratio > 1 and mask != 0:
+        common["cmp_residual_k"] = torch.ones(batch_size, dtype=torch.int32, device=device)
+    metadata = torch.ops._C_ascend.npu_quant_lightning_indexer_v2_metadata(
+        heads,
+        1,
+        width,
+        topk,
+        2,
+        batch_size=batch_size,
+        max_seqlen_k=max(key_lengths) * ratio + int(ratio > 1 and mask != 0),
+        device=device,
+        **common,
+    )
+    offsets = torch.arange(query.numel() // (heads * width), dtype=torch.int32, device=device)
+    offsets = (offsets * 17).reshape(*query_shape, 1)
+
+    def run(mode, candidates=None):
+        return torch.ops._C_ascend.npu_quant_lightning_indexer_v3(
+            query,
+            key,
+            weights,
+            query_scale,
+            key_scale,
+            topk,
+            2,
+            block_table=table,
+            output_idx_offset=offsets,
+            metadata=metadata,
+            candidate_topk_index=candidates,
+            candidate_mode=mode,
+            candidate_topk_blocks=candidate_count,
+            candidate_block_size=8,
+            **common,
+        )
+
+    return run
+
+
+@pytest.mark.parametrize(
+    "query_counts,key_lengths,layout,ratio,mask",
+    [
+        ([1, 1], [16385, 8193], "TND", 1, 3),
+        ([1, 5, 2], [8193, 16385, 4097], "TND", 2, 3),
+        ([0, 3, 0, 1], [0, 16385, 0, 8193], "TND", 1, 3),
+        ([1] * 8, [16385] * 8, "TND", 4, 0),
+        ([1] * 12, [8193] * 12, "TND", 1, 3),
+        ([1] * 13, [8193] * 13, "TND", 1, 3),
+        ([1] * 16, [8193] * 16, "TND", 1, 3),
+        ([1] * 23, [8193] * 23, "TND", 1, 3),
+        ([1] * 24, [8193] * 24, "TND", 1, 3),
+        ([6] * 16, [4097] * 16, "TND", 1, 3),
+        ([1, 5], [513, 8193], "TND", 1, 3),
+        ([1, 1], [0, 8193], "TND", 1, 3),
+        ([3, 3], [16385, 8193], "BSND", 1, 3),
+        ([1, 5], [8193, 16385], "BSND", 1, 3),
+    ],
+)
+@pytest.mark.parametrize("pattern", ["source", "duplicate", "empty", "clustered"])
+@pytest.mark.skipif(
+    get_ascend_device_type() not in (AscendDeviceType.A2, AscendDeviceType.A3),
+    reason="QuantLightningIndexer candidate mode is supported only on Ascend A2/A3",
+)
+def test_candidate_split_k_multiple_requests(query_counts, key_lengths, layout, ratio, mask, pattern):
+    run = _make_multibatch_candidate_case(query_counts, key_lengths, layout, ratio, mask)
+    candidates = run(1)[2]
+    if pattern == "duplicate":
+        candidates[..., 1::2] = candidates[..., ::2]
+    elif pattern == "empty":
+        candidates.fill_(-1)
+    elif pattern == "clustered":
+        candidates.copy_(torch.arange(candidates.shape[-1], dtype=torch.int32, device="npu"))
+    reference = run(2, candidates)[0].cpu().sort(dim=-1).values
+    for _ in range(3):
+        actual = run(4, candidates)[0].cpu().sort(dim=-1).values
+        torch.testing.assert_close(actual, reference, rtol=0, atol=0)
